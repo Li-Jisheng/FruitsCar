@@ -1,0 +1,9 @@
+﻿{
+  "host": "127.0.0.1",
+  "portMode": "project",
+  "toolProfile": "core",
+  "autostart": true,
+  "enableSessions": false,
+  "enableConsoleLogging": true,
+  "executeJavascriptSafetyChecks": true
+}

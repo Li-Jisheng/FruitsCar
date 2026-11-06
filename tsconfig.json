@@ -1,0 +1,11 @@
+{
+  /* 基础配置，请勿修改此字段。 */
+  "extends": "./temp/tsconfig.cocos.json",
+
+  /* 项目代码启用严格模式；引擎声明由编辑器负责类型检查。 */
+  "compilerOptions": {
+    "strict": true,
+    "skipLibCheck": true,
+    "noImplicitAny": true
+  }
+}
