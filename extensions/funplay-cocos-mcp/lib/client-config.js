@@ -1,0 +1,483 @@
+'use strict';
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { getProjectIdentity } = require('./config');
+const { serverUrl } = require('./project-context');
+const { readOptionalText, writeTextIfUnchanged } = require('./atomic-file');
+const { findGitRootOrSelf } = require('./skill-platforms');
+const { parseJsonc, updateJsonc } = require('./jsonc');
+
+const SERVER_NAME = 'funplay_cocos';
+
+function getServerName(config) {
+  if (!config.projectPath) return SERVER_NAME; // Compatibility for callers without project context.
+  const identity = getProjectIdentity(config.projectPath);
+  const slug = path.basename(config.projectPath).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 12).replace(/-$/, '') || 'project';
+  return `cocos-${slug}-${identity.slice(0, 6)}`;
+}
+
+function getPreviousEntry(config, targetId) {
+  const record = config.clientConfigEntries && config.clientConfigEntries[targetId];
+  // A copied project config is not proof of ownership of the source project's client entry.
+  return record && record.projectIdentity === getProjectIdentity(config.projectPath)
+    && (record.serverName === SERVER_NAME || /^cocos-[a-z0-9-]+$/.test(record.serverName)) ? record : undefined;
+}
+
+function isObject(value) { return Boolean(value && typeof value === 'object' && !Array.isArray(value)); }
+
+// Claude Code keys `projects` by a forward-slash path even on Windows, where path.resolve
+// yields backslashes. A backslash key is a distinct entry that Claude Code never reads.
+function getClaudeScopePath(projectPath, platform = process.platform, resolveGitRoot = findGitRootOrSelf) {
+  const resolved = resolveGitRoot(projectPath);
+  return platform === 'win32' ? resolved.replace(/\\/g, '/') : resolved;
+}
+
+// Claude Code preserves whatever drive-letter case its cwd had, so the same directory can
+// already be keyed as `D:/repo` or `d:/repo`. Reuse that key instead of adding a duplicate.
+function resolveProjectKey(projects, scopePath, platform = process.platform) {
+  if (!isObject(projects) || projects[scopePath] !== undefined || platform !== 'win32') return scopePath;
+  const lowered = scopePath.toLowerCase();
+  return Object.keys(projects).find((key) => key.toLowerCase() === lowered) || scopePath;
+}
+
+function getServerContainer(root, target, create = false) {
+  if (!isObject(root)) throw new Error('MCP configuration must be a JSON object.');
+  const keys = target.scopePath
+    ? ['projects', resolveProjectKey(root.projects, target.scopePath, target.platform), target.rootKey || 'mcpServers']
+    : [target.rootKey || 'mcpServers'];
+  let current = root;
+  for (const key of keys) {
+    if (current[key] === undefined) {
+      if (!create) return null;
+      current[key] = {};
+    }
+    if (!isObject(current[key])) throw new Error(`MCP configuration field '${key}' must be an object; the file was left unchanged.`);
+    current = current[key];
+  }
+  return current;
+}
+
+function formatTargetPreview(target) {
+  const name = target.serverName || SERVER_NAME;
+  if (target.isToml) return `[mcp_servers.${name}]\nurl = "${target.url}"\n`;
+  if (target.isDsh) return JSON.stringify(getDshPatch(target), null, 2) + '\n';
+  const root = {};
+  getServerContainer(root, target, true)[name] = target.entry;
+  return JSON.stringify(root, null, 2);
+}
+
+function isGeneratedEntry(entry, url) {
+  return isObject(entry) && entry.url === url && Object.keys(entry).every((key) => key === 'url' || (key === 'type' && (entry.type === 'http' || entry.type === 'remote')));
+}
+
+function canReplaceEntry(target, name, url) {
+  const previous = target.previousEntry;
+  return url === (target.url || target.entry.url)
+    || Boolean(target.migrateLegacy && name === target.serverName && url === target.legacyUrl)
+    || Boolean(previous && previous.serverName === name && previous.url === url && previous.configPath === target.configPath);
+}
+
+function getUserHomePath() {
+  const home = os.homedir();
+  if (home) {
+    return home;
+  }
+
+  const homeDrive = process.env.HOMEDRIVE;
+  const homePath = process.env.HOMEPATH;
+  if (homeDrive && homePath) {
+    return `${homeDrive}${homePath}`;
+  }
+
+  return process.env.HOME || '';
+}
+
+function getVSCodeConfigPath(homePath, options = {}) {
+  const platform = options.platform || process.platform;
+  const env = options.env || process.env;
+  const existsSync = options.existsSync || fs.existsSync;
+
+  switch (platform) {
+    case 'win32': {
+      const appData = env.APPDATA || path.join(homePath, 'AppData', 'Roaming');
+      return path.join(appData, 'Code', 'User', 'mcp.json');
+    }
+
+    case 'darwin': {
+      const primaryPath = path.join(homePath, 'Library', 'Application Support', 'Code', 'User', 'mcp.json');
+      const primaryDirectory = path.dirname(primaryPath);
+      if (existsSync(primaryPath) || existsSync(primaryDirectory)) {
+        return primaryPath;
+      }
+      return path.join(homePath, '.vscode', 'mcp.json');
+    }
+
+    case 'linux':
+      return path.join(homePath, '.config', 'Code', 'User', 'mcp.json');
+
+    default:
+      return path.join(homePath, '.vscode', 'mcp.json');
+  }
+}
+
+function getOpenCodeConfigPath(homePath, options = {}) {
+  const env = options.env || process.env;
+  const existsSync = options.existsSync || fs.existsSync;
+
+  // OpenCode resolves its global config dir cross-platform via xdg-basedir
+  // (packages/core/src/global.ts): XDG_CONFIG_HOME wins, else ~/.config.
+  // There is no APPDATA or macOS Application Support branch.
+  const xdgHome = String(env && env.XDG_CONFIG_HOME || '').trim();
+  const configDir = xdgHome || path.join(homePath, '.config');
+  const dir = path.join(configDir, 'opencode');
+  // globalConfigFile() prefers opencode.jsonc over opencode.json; write
+  // where the user already keeps the file, else the canonical .json.
+  const jsonc = path.join(dir, 'opencode.jsonc');
+  return existsSync(jsonc) ? jsonc : path.join(dir, 'opencode.json');
+}
+
+function getConfiguredDirectory(env, key, fallback) {
+  const configured = String(env && env[key] || '').trim();
+  return configured || fallback;
+}
+
+function ensureParent(filePath) {
+  const dir = path.dirname(filePath);
+  if (dir && !fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+}
+
+function readJson(filePath, isJsonc = false) {
+  if (!fs.existsSync(filePath)) {
+    return {};
+  }
+
+  const text = fs.readFileSync(filePath, 'utf8').trim();
+  if (!text) {
+    return {};
+  }
+
+  return isJsonc ? parseJsonc(text) : JSON.parse(text);
+}
+
+function configureJsonTarget(target) {
+  const original = readOptionalText(target.configPath);
+  const root = target.isJsonc ? parseJsonc(original || '') : (original && original.trim() ? JSON.parse(original) : {});
+  const servers = getServerContainer(root, target, true);
+  const name = target.serverName || SERVER_NAME;
+  const existing = servers[name];
+  if (existing !== undefined && (!isObject(existing) || !canReplaceEntry(target, name, existing.url))) throw new Error(`MCP entry '${name}' already belongs to another endpoint. Existing configuration was left unchanged.`);
+  const previous = target.previousEntry;
+  if (previous && previous.configPath === target.configPath && previous.serverName !== name && isGeneratedEntry(servers[previous.serverName], previous.url)) delete servers[previous.serverName];
+  if (target.migrateLegacy && name !== SERVER_NAME && isGeneratedEntry(servers[SERVER_NAME], target.entry.url)) delete servers[SERVER_NAME];
+  if (target.scopePath && target.migrateLegacy && isObject(root.mcpServers) && isGeneratedEntry(root.mcpServers[SERVER_NAME], target.entry.url)) delete root.mcpServers[SERVER_NAME];
+  servers[name] = { ...(existing || {}), ...target.entry };
+  const content = target.isJsonc ? updateJsonc(original || '', root) : JSON.stringify(root, null, 2) + '\n';
+  if (content !== original) writeTextIfUnchanged(target.configPath, content, original);
+}
+
+// DSH accepts JSON as YAML for --patch. Keep a dedicated project overlay instead
+// of parsing/replacing a user's Cordis YAML (which can contain executable !!js).
+function getDshPatch(target, existing = {}) {
+  return [{ insert: [{
+    ...existing,
+    id: target.serverName,
+    name: '@deepseek-ai/dsh-mcp-client',
+    config: { ...existing.config, ...target.entry },
+  }] }];
+}
+
+function readDshEntry(target, text) {
+  JSON.parse(text); // Reject JSONC, which is not valid YAML/JSON for DSH.
+  const patches = parseJsonc(text); // Also reject duplicate/ambiguous JSON keys.
+  const patch = Array.isArray(patches) && patches.length === 1 && patches[0];
+  const entry = isObject(patch) && Object.keys(patch).length === 1
+    && Array.isArray(patch.insert) && patch.insert.length === 1 && patch.insert[0];
+  if (!isObject(entry) || Object.keys(entry).some((key) => !['id', 'name', 'config', 'disabled'].includes(key))
+    || entry.id !== target.serverName || entry.name !== '@deepseek-ai/dsh-mcp-client'
+    || !isObject(entry.config) || entry.config.serverName !== target.serverName
+    || entry.config.transport !== 'streamable-http') {
+    throw new Error('The dedicated DSH overlay contains unrelated or ambiguous entries; the file was left unchanged.');
+  }
+  if (entry.disabled !== undefined && entry.disabled !== false) {
+    throw new Error('The DSH MCP entry is disabled; review it manually. The file was left unchanged.');
+  }
+  return entry;
+}
+
+function configureDshTarget(target) {
+  const original = readOptionalText(target.configPath);
+  const existing = original === null ? {} : readDshEntry(target, original);
+  if (existing.config && !canReplaceEntry(target, target.serverName, existing.config.url)) {
+    throw new Error(`MCP entry '${target.serverName}' already belongs to another endpoint. Existing configuration was left unchanged.`);
+  }
+  const content = JSON.stringify(getDshPatch(target, existing), null, 2) + '\n';
+  if (content !== original) writeTextIfUnchanged(target.configPath, content, original);
+}
+
+function getDshLaunchCommand(configPath, platform) {
+  // Single-quote paths for the host's POSIX shell or Windows PowerShell. Do not
+  // interpolate project names as executable shell syntax in the displayed hint.
+  const quoted = platform === 'win32' ? configPath.replace(/'/g, "''") : configPath.replace(/'/g, "'\\''");
+  return `dsh web --patch '${quoted}'`;
+}
+
+function configureTomlTarget(target) {
+  ensureParent(target.configPath);
+  const name = target.serverName || SERVER_NAME;
+  const sectionHeader = `[mcp_servers.${name}]`;
+  const section = `${sectionHeader}\nurl = "${target.url}"\n`;
+  const original = readOptionalText(target.configPath);
+  let content = original || '';
+  const blocks = getTomlBlocks(content);
+  const existing = blocks.find((block) => block.name === name);
+  if (existing) {
+    if (!canReplaceEntry(target, name, existing.url)) throw new Error(`MCP entry '${name}' already belongs to another endpoint. Existing configuration was left unchanged.`);
+    const updated = existing.text.replace(/^[ \t]*url[ \t]*=[^\n]*/m, `url = "${target.url}"`);
+    content = content.slice(0, existing.start) + updated + content.slice(existing.end);
+  } else {
+    if (content.length > 0 && !content.endsWith('\n')) {
+      content += '\n';
+    }
+    if (content.length > 0) {
+      content += '\n';
+    }
+    content += section;
+  }
+  // Retire only exact generated URL-only blocks that this project can identify.
+  const previous = target.previousEntry;
+  const retired = getTomlBlocks(content).filter((block) => block.name !== name && (
+    (target.migrateLegacy && block.name === SERVER_NAME && block.url === target.url) ||
+    (previous && previous.configPath === target.configPath && block.name === previous.serverName && block.url === previous.url)
+  ) && !block.hasChildren && block.text.trim().split('\n').length === 2);
+  for (const block of retired.reverse()) content = content.slice(0, block.start) + content.slice(block.end);
+  writeTextIfUnchanged(target.configPath, content, original);
+}
+
+function getTomlBlocks(content) {
+  // Do not guess at TOML forms that could hide table-looking text inside strings.
+  const first = content.replace(/^\uFEFF/, '').split(/\r?\n/).find((line) => line.trim() && !line.trim().startsWith('#'));
+  if (first && /^[ \t]*[{}=]/.test(first)) throw new Error('This is not a supported TOML configuration; review it manually. The file was left unchanged.');
+  if (/"""|'''|^[ \t]*mcp_servers[ \t]*=/m.test(content)) throw new Error('This TOML uses multiline strings or inline MCP tables. Configure it manually; the file was left unchanged.');
+  const headers = [...content.matchAll(/^[ \t]*\[(\[[^\]\r\n]+\]|[^\]\r\n]+)\][ \t]*(?:#[^\n]*)?\r?$/gm)];
+  const blocks = [];
+  for (let index = 0; index < headers.length; index += 1) {
+    const header = headers[index];
+    if (header[1].trim() === 'mcp_servers') throw new Error('Use explicit [mcp_servers.name] tables to configure automatically.');
+    const match = header[1].trim().match(/^mcp_servers\s*\.\s*(?:([A-Za-z0-9_-]+)|"([A-Za-z0-9_-]+)"|'([A-Za-z0-9_-]+)')$/);
+    if (!match) continue;
+    const start = header.index;
+    const end = index + 1 < headers.length ? headers[index + 1].index : content.length;
+    const text = content.slice(start, end);
+    const urls = [...text.matchAll(/^[ \t]*url[ \t]*=[ \t]*["']([^"']+)["'][ \t]*(?:#[^\n]*)?\r?$/gm)];
+    const name = match[1] || match[2] || match[3];
+    if (blocks.some((block) => block.name === name) || urls.length > 1) throw new Error('Duplicate MCP table or URL; configuration was left unchanged.');
+    const hasChildren = headers.some((item) => [name, `"${name}"`, `'${name}'`].some((key) => item[1].trim().replace(/\s*\.\s*/g, '.').startsWith(`mcp_servers.${key}.`)));
+    blocks.push({ name, start, end, text, hasChildren, url: urls.length ? urls[0][1] : '' });
+  }
+  return blocks;
+}
+
+function buildTargets(config, options = {}) {
+  const home = options.homePath || getUserHomePath();
+  const env = options.env || process.env;
+  const platform = options.platform || process.platform;
+  const resolveGitRoot = options.resolveGitRoot || findGitRootOrSelf;
+  const url = serverUrl(config);
+
+  return [
+    {
+      id: 'claude_code',
+      name: 'Claude Code',
+      configPath: path.join(home, '.claude.json'),
+      rootKey: 'mcpServers',
+      entry: { type: 'http', url },
+    },
+    {
+      id: 'cursor',
+      name: 'Cursor',
+      configPath: path.join(home, '.cursor', 'mcp.json'),
+      rootKey: 'mcpServers',
+      entry: { url },
+    },
+    {
+      id: 'vscode',
+      name: 'VS Code',
+      configPath: getVSCodeConfigPath(home, options),
+      rootKey: 'servers',
+      entry: { type: 'http', url },
+    },
+    {
+      id: 'trae',
+      name: 'Trae',
+      configPath: path.join(home, '.trae', 'mcp.json'),
+      rootKey: 'mcpServers',
+      entry: { url },
+    },
+    {
+      id: 'kiro',
+      name: 'Kiro',
+      configPath: path.join(home, '.kiro', 'settings', 'mcp.json'),
+      rootKey: 'mcpServers',
+      entry: { type: 'http', url },
+    },
+    {
+      id: 'qoder',
+      name: 'Qoder',
+      configPath: path.join(
+        getConfiguredDirectory(env, 'QODER_CONFIG_DIR', path.join(home, '.qoder')),
+        'settings.json'
+      ),
+      rootKey: 'mcpServers',
+      entry: { type: 'http', url },
+    },
+    {
+      id: 'kimi',
+      name: 'Kimi Code',
+      configPath: path.join(
+        getConfiguredDirectory(env, 'KIMI_CODE_HOME', path.join(home, '.kimi-code')),
+        'mcp.json'
+      ),
+      rootKey: 'mcpServers',
+      entry: { url },
+    },
+    {
+      id: 'codex',
+      name: 'Codex',
+      configPath: path.join(home, '.codex', 'config.toml'),
+      isToml: true,
+      url,
+    },
+    {
+      id: 'opencode',
+      name: 'OpenCode',
+      configPath: getOpenCodeConfigPath(home, options),
+      rootKey: 'mcp',
+      entry: { type: 'remote', url },
+      isJsonc: true,
+    },
+    // CodeBuddy IDE 4.0+ reads project-root .mcp.json. Do not guess a
+    // global CLI/plugin path, or write a relative file without a project.
+    ...(config.projectPath ? [{
+      id: 'codebuddy',
+      name: 'CodeBuddy IDE',
+      configPath: path.resolve(config.projectPath, '.mcp.json'),
+      rootKey: 'mcpServers',
+      entry: { type: 'http', url },
+      isJsonc: true,
+    }, {
+      id: 'deepseek_harness',
+      name: 'DeepSeek Harness (DSH)',
+      configPath: path.resolve(config.projectPath, '.dsh', 'funplay-cocos-mcp.patch.json'),
+      isDsh: true,
+      entry: { serverName: getServerName(config), transport: 'streamable-http', url },
+      launchCommand: getDshLaunchCommand(path.resolve(config.projectPath, '.dsh', 'funplay-cocos-mcp.patch.json'), platform),
+    }] : []),
+  ].map((target) => config.projectPath ? ({
+    ...target,
+    serverName: getServerName(config),
+    ...(target.id === 'claude_code'
+      ? { scopePath: getClaudeScopePath(config.projectPath, platform, resolveGitRoot), platform }
+      : {}),
+    previousEntry: getPreviousEntry(config, target.id),
+    legacyUrl: serverUrl(config, config.port, ''),
+    migrateLegacy: config.migrateLegacy === true,
+  }) : target);
+}
+
+function getTomlServerUrl(target) {
+  if (!fs.existsSync(target.configPath)) {
+    return '';
+  }
+  const content = fs.readFileSync(target.configPath, 'utf8');
+  const block = getTomlBlocks(content).find((item) => item.name === (target.serverName || SERVER_NAME));
+  return block ? block.url : '';
+}
+
+function inspectTarget(target) {
+  if (!fs.existsSync(target.configPath)) {
+    return { configured: false };
+  }
+
+  try {
+    let url;
+    let configured;
+    if (target.isToml) {
+      url = getTomlServerUrl(target);
+      configured = url === target.url;
+    } else if (target.isDsh) {
+      const entry = readDshEntry(target, fs.readFileSync(target.configPath, 'utf8'));
+      url = entry.config.url;
+      configured = Object.entries(target.entry).every(([key, value]) => entry.config[key] === value);
+    } else {
+      const root = readJson(target.configPath, target.isJsonc);
+      const servers = getServerContainer(root, target);
+      const entry = servers && servers[target.serverName || SERVER_NAME];
+      url = isObject(entry) ? entry.url : '';
+      configured = Boolean(isObject(entry) && Object.entries(target.entry).every(([key, value]) => entry[key] === value));
+      // Do not remove an old shared entry. Offer a separate project-bound entry.
+      if (!entry && target.legacyUrl && servers && isObject(servers[SERVER_NAME]) && servers[SERVER_NAME].url === target.legacyUrl) {
+        return { configured: false, needsReconfigure: true, canReconfigure: true };
+      }
+    }
+    const legacy = Boolean(target.legacyUrl && url === target.legacyUrl && url !== target.url);
+    return { configured, ...(legacy ? { needsReconfigure: true, canReconfigure: canReplaceEntry(target, target.serverName, url) } : {}) };
+  } catch (error) {
+    return { configured: false, readError: error.message.slice(0, 500) };
+  }
+}
+
+function getTargetStatuses(config, options = {}) {
+  return buildTargets(config, options).map((target) => ({
+    id: target.id,
+    name: target.name,
+    configPath: target.configPath,
+    serverName: target.serverName || SERVER_NAME,
+    ...inspectTarget(target),
+    isToml: Boolean(target.isToml),
+    ...(target.launchCommand ? { launchCommand: target.launchCommand } : {}),
+  }));
+}
+
+function configureTarget(config, targetId, options = {}) {
+  if (config.stablePort !== undefined && config.port !== config.stablePort) throw new Error('Server is using a temporary fallback port. Pin the current port or use the per-project port before configuring a client.');
+  const targets = buildTargets(config, options);
+  const target = targets.find((item) => item.id === targetId);
+  if (!target) {
+    throw new Error(`Unknown MCP client target: ${targetId}`);
+  }
+
+  if (target.isToml) {
+    configureTomlTarget(target);
+  } else if (target.isDsh) {
+    configureDshTarget(target);
+  } else {
+    configureJsonTarget(target);
+  }
+
+  return {
+    id: target.id,
+    name: target.name,
+    configPath: target.configPath,
+    configured: true,
+    serverName: target.serverName || SERVER_NAME,
+    url: target.url || target.entry.url,
+    projectIdentity: config.projectPath ? getProjectIdentity(config.projectPath) : '',
+    ...(target.launchCommand ? { launchCommand: target.launchCommand } : {}),
+    restartHint: target.launchCommand
+      ? `From the Cocos project directory, start DSH with: ${target.launchCommand}. The overlay is not loaded automatically.`
+      : `Please restart ${target.name} for the MCP configuration to take effect.`,
+  };
+}
+
+module.exports = {
+  SERVER_NAME,
+  getServerName,
+  formatTargetPreview,
+  buildTargets,
+  configureTarget,
+  getTargetStatuses,
+};
