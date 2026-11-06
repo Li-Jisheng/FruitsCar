@@ -1,0 +1,25 @@
+{
+  "version": 2,
+  "levels": [
+    { "id": "L_RING_OMEGA", "order": 1, "name": "环形果园",
+      "file": "levels/L_RING_OMEGA.json",
+      "subtitle": "半圆环公路 · 五扇区 · 只收最内层",
+      "tag": "环形", "difficulty": 3, "accent": "#F2C14E" },
+    { "id": "L_ZIGZAG_WIDE", "order": 2, "name": "折线货道",
+      "file": "levels/L_ZIGZAG_WIDE.json",
+      "subtitle": "两倍宽公路 · 左右交替取货",
+      "tag": "宽路", "difficulty": 3, "accent": "#5B8DEF" },
+    { "id": "L_CURVE_RING", "order": 3, "name": "曲线环形果园",
+      "file": "levels/L_CURVE_RING.json",
+      "subtitle": "控制点画出的曲线公路 · 三层沿曲线排列",
+      "tag": "曲线", "difficulty": 3, "accent": "#48BA74" },
+    { "id": "L_CURVE_S", "order": 4, "name": "S 形弯道",
+      "file": "levels/L_CURVE_S.json",
+      "subtitle": "连续反向弯道 · 横向带精准取货",
+      "tag": "曲线", "difficulty": 2, "accent": "#F2C14E" },
+    { "id": "L_CURVE_POLY", "order": 5, "name": "多边形与开放层",
+      "file": "levels/L_CURVE_POLY.json",
+      "subtitle": "自由点集 · 开放曲线层 · 中心留洞",
+      "tag": "曲线", "difficulty": 3, "accent": "#A05CD0" }
+  ]
+}

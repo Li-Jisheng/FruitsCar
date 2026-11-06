@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 2,
+  "id": "L_ZIGZAG_WIDE",
+  "name": "折线货道",
+  "seed": 20261105,
+  "grid": { "rows": 9, "cols": 10 },
+  "palette": ["red", "yellow", "blue"],
+  "fruits": {
+    "generator": "explicit",
+    "refillDirection": "regionIn",
+    "colors": ["red", "yellow", "blue"],
+    "cells": [
+      ["red", "red", "red", null, null, "yellow", "blue", "blue", "blue", "red"],
+      ["red", "red", "red", null, null, "yellow", "blue", "blue", "blue", "red"],
+      ["red", "red", "red", null, null, "yellow", "blue", "blue", "blue", "red"],
+      ["yellow", "yellow", "yellow", null, null, "blue", "red", "red", "red", "yellow"],
+      ["yellow", "yellow", "yellow", null, null, null, null, null, null, "yellow"],
+      ["yellow", "yellow", "yellow", "blue", null, null, null, null, null, "yellow"],
+      ["blue", "blue", "blue", "red", "red", "red", "yellow", null, null, "blue"],
+      ["blue", "blue", "blue", "red", "red", "red", "yellow", null, null, "blue"],
+      ["blue", "blue", "blue", "red", "red", "red", "yellow", null, null, "blue"]
+    ]
+  },
+  "road": {
+    "path": [
+      [0,4], [1,4], [2,4], [3,4], [4,4], [4,5], [4,6], [4,7],
+      [4,8], [5,8], [6,8], [7,8], [8,8]
+    ],
+    "track": [
+      [0,3], [0,4], [1,3], [1,4], [2,3], [2,4], [3,3], [3,4],
+      [4,3], [4,4], [4,5], [4,6], [4,7], [4,8], [5,4], [5,5],
+      [5,6], [5,7], [5,8], [6,7], [6,8], [7,7], [7,8], [8,7],
+      [8,8]
+    ],
+    "width": 2,
+    "collectSides": ["left", "right"],
+    "laneCycle": [0, 1],
+    "bendCollectsBoth": true,
+    "carLength": 1.0, "carGap": 0.5, "speed": 2.0
+  },
+  "parking": { "slotCount": 5, "lanes": [
+    { "color": "red", "queue": ["v_r16", "v_r8"] },
+    { "color": "yellow", "queue": ["v_y16", "v_y4"] },
+    { "color": "blue", "queue": ["v_b16", "v_b8"] }
+  ] },
+  "vehicles": {
+    "v_r16": { "color": "red", "capacity": 16 },
+    "v_r8": { "color": "red", "capacity": 8 },
+    "v_y16": { "color": "yellow", "capacity": 16 },
+    "v_y4": { "color": "yellow", "capacity": 4 },
+    "v_b16": { "color": "blue", "capacity": 16 },
+    "v_b8": { "color": "blue", "capacity": 8 }
+  },
+  "timing": { "spawnIntervalMs": 500, "settleTicks": 30 }
+}
